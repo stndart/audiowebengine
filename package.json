@@ -1,0 +1,60 @@
+{
+  "name": "@homeweblab/audio-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Framework-agnostic dual-mode audio engine (discrete + continuous HLS) for SvelteKit and beyond",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./svelte": {
+      "types": "./dist/svelte/index.d.ts",
+      "import": "./dist/svelte/index.js"
+    },
+    "./offline": {
+      "types": "./dist/offline/index.d.ts",
+      "import": "./dist/offline/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "nanoevents": "^10.0.0"
+  },
+  "peerDependencies": {
+    "hls.js": "^1.6.0",
+    "svelte": "^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "hls.js": {
+      "optional": true
+    },
+    "svelte": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "hls.js": "^1.6.17",
+    "svelte": "^5.56.1",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  }
+}
