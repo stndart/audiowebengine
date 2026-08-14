@@ -12,11 +12,11 @@ export function estimatePrefetchBytes(
   return Math.max(64_000, Math.ceil(seconds * bytesPerSec));
 }
 
-/** Warm slot must never `preload="auto"` — that can pull an entire hour-long FLAC. */
+/** Play and warm both use `auto`. Browser readahead caps how much of a long file is pulled. */
 export function progressivePreloadFor(
-  intent: "play" | "prefetch-next",
+  _intent: "play" | "prefetch-next",
 ): "auto" | "none" {
-  return intent === "play" ? "auto" : "none";
+  return "auto";
 }
 
 export type ProgressiveWarmResult = {
@@ -27,10 +27,9 @@ export type ProgressiveWarmResult = {
 };
 
 /**
- * Warm the first N seconds of a progressive file via Range.
- * Does NOT replace audio.src with a blob (partial blobs truncate).
- * Does NOT write a separate Cache API key — playback still uses the network URL;
- * the browser HTTP cache is best-effort for credentialed Range vs later media GET.
+ * HTTP Range warm of the first N seconds. The engine no longer calls this:
+ * discrete prefetch attaches the URL to the warm `<audio>` with preload=auto.
+ * Kept as a public helper. Does NOT replace audio.src with a blob (truncation).
  */
 export async function warmProgressiveRange(
   source: ProgressiveSource,

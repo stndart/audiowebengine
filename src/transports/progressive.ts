@@ -1,7 +1,7 @@
 import type { AttachedMedia, PlaybackSource } from "../types.js";
 
 export type AttachProgressiveOptions = {
-  /** Default `auto` for playback. Warm/prefetch must pass `none`. */
+  /** Default `auto`. Warm and play both load; `none` would leave `src` idle. */
   preload?: "none" | "metadata" | "auto";
 };
 
@@ -16,6 +16,13 @@ export function attachProgressive(
     audio.setAttribute("type", source.mime);
   }
   audio.src = source.url;
+  if (audio.preload !== "none") {
+    try {
+      audio.load();
+    } catch {
+      /* ignore */
+    }
+  }
   return {
     destroy: () => {
       audio.pause();

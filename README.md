@@ -2,7 +2,7 @@
 
 Framework-agnostic dual-mode audio engine for music apps (SvelteKit-friendly).
 
-- **Discrete mode** — per-track progressive / HLS URLs, dual `<audio>` pool, configurable Range prefetch
+- **Discrete mode** — per-track progressive / HLS URLs, dual `<audio>` pool, next-track warm via `preload="auto"`
 - **Continuous mode** — queue-level m3u8 + virtual timeline (like HomeWebLab webplayer)
 - Events: `play`, `pause`, `trackchange`, `timeupdate`, `beforeend`, `progress`, `ended`, `error`
 - Media Session API
@@ -141,9 +141,9 @@ Any action can be overridden (`play`, `pause`, `nexttrack`, `previoustrack`, `se
 
 Opt-in via `prefetch.enabled`. When on, discrete mode warms the next track on `beforeend` (default 5s remaining). You do not need to call `prefetchNext()` yourself unless you want it earlier.
 
-- **Progressive:** HTTP `Range` for the first `progressiveSeconds` only. The warm `<audio>` uses `preload="none"` so an hour-long FLAC is not pulled in full. Playback still uses the network URL; HTTP cache reuse of that Range GET is **best-effort** (credentialed media often misses). Partial bodies are never used as `src` (truncation).
+- **Progressive:** attach the next URL to the warm `<audio>` with `preload="auto"` and `load()` so the element buffers. Promote reuses that node; later Range `206`s are the media pipeline continuing, not a discarded `fetch()`. Browser readahead caps how much of a long FLAC is pulled — there is no exact second budget. Partial bodies are never used as `src` (truncation). Desktop and iOS **foreground**; iOS **background** auto-advance is continuous HLS, not this path.
 - **HLS:** second instance with `maxMaxBufferLength` ≈ `hlsAheadSeconds`, then `pauseBuffering` once that much is buffered.
-- Signed URLs: pass `expiresAt`; warms that are inside a 15s skew window are skipped / not promoted.
+- Signed URLs: pass `expiresAt` as Unix milliseconds (`Date.now()` clock). Warms inside a 15s skew window are skipped / not promoted.
 
 ## Offline helpers (not wired to playback)
 
@@ -171,6 +171,5 @@ import {
 ## Architecture notes
 
 - App owns **SourceAdapter** (API schema stays out of this package).
-- Progressive prefetch uses **HTTP Range**, not `preload="auto"` (no byte budget on the attribute).
-- Never blob-replace a partial progressive download as `src` (truncation risk).
+- Progressive prefetch attaches the next URL with `preload="auto"` so the warm element buffers. Do not use a partial Range body as `src`.
 - Prefer **hls.js light when `Hls.isSupported()`**, else native HLS (Android `canPlayType` is unreliable).

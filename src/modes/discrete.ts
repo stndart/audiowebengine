@@ -10,7 +10,6 @@ import { DualAudioPool } from "../pool.js";
 import {
   PrefetchController,
   progressivePreloadFor,
-  warmProgressiveRange,
 } from "../prefetch/progressive-range.js";
 import {
   capHlsBuffer,
@@ -229,30 +228,22 @@ export class DiscreteQueueMode {
       if (isExpiringSoon(resolved.source.expiresAt)) return;
 
       if (resolved.source.kind === "progressive") {
-        await warmProgressiveRange(resolved.source, {
-          seconds: cfg.progressiveSeconds ?? 12,
-          defaultBitrate: cfg.defaultBitrate,
-          signal: this.prefetchCtrl.signal,
-        });
-        if (this.stale(gen)) return;
-
-        if (this.pool.isUnlocked) {
-          this.nextAttached?.destroy();
-          const attached = await attachSource(
-            this.pool.next,
-            resolved.source,
-            {
-              ...this.hlsOpts(),
-              preload: progressivePreloadFor("prefetch-next"),
-            },
-          );
-          if (this.stale(gen)) {
-            attached.destroy();
-            return;
-          }
-          this.nextAttached = attached;
-          this.nextResolved = resolved;
+        this.pool.next.pause();
+        this.nextAttached?.destroy();
+        const attached = await attachSource(
+          this.pool.next,
+          resolved.source,
+          {
+            ...this.hlsOpts(),
+            preload: progressivePreloadFor("prefetch-next"),
+          },
+        );
+        if (this.stale(gen)) {
+          attached.destroy();
+          return;
         }
+        this.nextAttached = attached;
+        this.nextResolved = resolved;
         return;
       }
 

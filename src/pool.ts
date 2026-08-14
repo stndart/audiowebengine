@@ -73,12 +73,21 @@ export class DualAudioPool {
     const silent = async (el: HTMLAudioElement) => {
       try {
         el.muted = true;
-        await el.play();
-        el.pause();
-        el.currentTime = 0;
+        // Empty src: Chrome's play() promise may never settle. Don't block
+        // unlock / later attach on that.
+        await Promise.race([
+          el.play(),
+          new Promise<void>((resolve) => setTimeout(resolve, 120)),
+        ]);
       } catch {
         /* ignore — first real play() will still be gesture-driven */
       } finally {
+        try {
+          el.pause();
+          if (el.src) el.currentTime = 0;
+        } catch {
+          /* ignore */
+        }
         el.muted = false;
       }
     };

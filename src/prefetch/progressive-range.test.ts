@@ -18,9 +18,9 @@ describe("estimatePrefetchBytes", () => {
 });
 
 describe("progressivePreloadFor", () => {
-  it("never uses auto on the warm slot", () => {
+  it("loads the warm slot instead of leaving src idle", () => {
     expect(progressivePreloadFor("play")).toBe("auto");
-    expect(progressivePreloadFor("prefetch-next")).toBe("none");
+    expect(progressivePreloadFor("prefetch-next")).toBe("auto");
   });
 });
 

@@ -18,7 +18,7 @@ If you are wiring this from `webfront-dev` (`EnginePlayer`), start with [Lifecyc
 
 Two playback modes share one public class:
 
-- **Discrete** — one URL per track. The engine keeps a *current* `<audio>` and a *next* (warm) `<audio>`. Crossing a track boundary can swap elements instead of tearing down and reloading.
+- **Discrete** — one URL per track. The engine keeps a *current* `<audio>` and a *next* (warm) `<audio>`. Crossing a track boundary can swap elements instead of tearing down and reloading. In scope for desktop and iOS **foreground**; iOS **background** auto-advance is continuous HLS.
 - **Continuous** — one queue-level HLS playlist plus a virtual timeline of track durations. Seeking “to the next track” is a seek on the same media clock.
 
 The engine never knows your REST schema. It only calls `adapter.resolve()` / `adapter.resolveContinuous()`. Track `ids`, discrete `queueId`, and continuous `queueKey` are **opaque strings**: the engine stores them and hands them back to the adapter (or echoes `queueId` on `trackchange`). See the README “Opaque ids” example.
@@ -81,10 +81,7 @@ If you only call `unlock()` later (timer, `trackchange` handler, prefetch callba
 
 ### Side effects you will not see in the method body
 
-The boolean `pool.isUnlocked` is also a **prefetch gate** in discrete mode:
-
-- Progressive next-track warm: Range-fetch still runs, but attaching the URL to the warm `<audio>` happens only when the pool is already unlocked.
-- So an early `unlock()` from the play click is what lets `beforeend` actually fill the next element.
+The boolean `pool.isUnlocked` is set at the start of `unlock()` so later `play()` on swap can proceed even if the silent `play()` is still settling. Discrete prefetch **attaches** the next `src` without waiting for unlock (buffering does not need a gesture). Call `unlock()` from the play click so iOS allows autoplay on that swap.
 
 ### When you do **not** need to call it
 
@@ -109,9 +106,9 @@ Does not create DOM nodes. Safe on the server.
 | Field | Default | Meaning |
 |---|---|---|
 | `prefetch.enabled` | `false` | Opt-in. Discrete: warm next track on `beforeend`. Continuous: enlarge HLS ahead-buffer near track end. |
-| `prefetch.progressiveSeconds` | `12` | Discrete progressive: HTTP `Range` size for the next file (seconds × bitrate). |
+| `prefetch.progressiveSeconds` | `12` | Unused by discrete prefetch (browser readahead). Kept for the exported `warmProgressiveRange` helper. |
 | `prefetch.hlsAheadSeconds` | `15` | Discrete HLS warm buffer cap; also feeds continuous ahead-buffer math. |
-| `prefetch.defaultBitrate` | `1_000_000` (bits/s) | Used when `byteRateHint` is missing. ~1 Mbps, FLAC-ish. |
+| `prefetch.defaultBitrate` | `1_000_000` (bits/s) | Unused by discrete prefetch. Used by `warmProgressiveRange` when `byteRateHint` is missing. |
 | `hooks.beforeEndSeconds` | `5` | Fire `beforeend` once when this many seconds remain on the **current logical track**. |
 | `hooks.progressPercents` | `[]` | Fire `progress` once per threshold (e.g. `[30, 90]`) as playback crosses that percent. |
 | `hls.withCredentials` | `true` | Cookies / credentialed HLS XHR. Also sets `<audio crossOrigin="use-credentials">`. |
@@ -159,7 +156,7 @@ Return:
 `ProgressiveSource`: `{ kind: "progressive", url, mime?, byteRateHint?, expiresAt? }`  
 `HlsSource`: `{ kind: "hls", url, expiresAt? }`
 
-`expiresAt` is Unix **milliseconds**. If the URL is within 15s of expiry (`EXPIRY_SKEW_MS`), the engine skips promoting / warming it rather than playing a URL that will 403 mid-buffer.
+`expiresAt` is Unix **milliseconds** (`Date.now()`). Not a datetime string, not local wall-clock. If the URL is within 15s of expiry (`EXPIRY_SKEW_MS`), the engine skips promoting / warming it rather than playing a URL that will 403 mid-buffer.
 
 ### `resolveContinuous` (continuous)
 
@@ -313,7 +310,7 @@ With `prefetch.enabled`:
 
 1. `adapter.resolve(id, { intent: "prefetch-next" })`.
 2. Skip if the signed URL is expiring soon.
-3. Progressive: `Range` GET for `progressiveSeconds`. Attach to the warm element only if the pool is unlocked. `preload="none"` so an hour-long FLAC is not pulled in full. The Range body is **never** used as `src` (truncation).
+3. Progressive: attach the URL to the warm `<audio>` with `preload="auto"` and `load()`, so `src` is set **and** the browser starts buffering. Do not `play()` the warm slot. Partial Range bodies are never used as `src`.
 4. HLS next: second hls.js instance with `maxMaxBufferLength ≈ hlsAheadSeconds`, then `pauseBuffering`.
 
 Automatic path: `beforeend` → `prefetchNext()`. Call this yourself only to warm earlier (e.g. user opened the queue).
@@ -474,7 +471,7 @@ Most hosts only need `AudioEngine` + types. Also exported from the package root:
 | `attachSource` / `attachHls` / `attachProgressive` | Attach a URL to an element (tests / custom hosts). |
 | `canPlayNativeHls` | Safari/iOS native HLS probe. Production path prefers hls.js when `Hls.isSupported()`. |
 | `buildTimeline` / `findTimelineIndex` / `timelineSeekTime` / `formatClock` | Continuous virtual clock helpers. |
-| `warmProgressiveRange` / `PrefetchController` | Discrete Range prefetch internals. |
+| `warmProgressiveRange` / `PrefetchController` | Range helper (unused by the engine) and prefetch abort generation. |
 | `isExpiringSoon` / `EXPIRY_SKEW_MS` | Signed-URL skew (15s). |
 | `MediaSessionActions` / `MediaSessionActionOverrides` | Types for `setMediaSessionActions`. |
 

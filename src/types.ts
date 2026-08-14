@@ -19,9 +19,9 @@ export type ProgressiveSource = {
   kind: "progressive";
   url: string;
   mime?: string;
-  /** Bytes per second hint for Range prefetch sizing. */
+  /** Bytes per second hint. Unused by discrete prefetch (browser readahead); kept for `warmProgressiveRange`. */
   byteRateHint?: number;
-  /** Unix ms when the signed URL expires (optional). */
+  /** Unix milliseconds since epoch. Same clock as `Date.now()` — not a local datetime. */
   expiresAt?: number;
 };
 
@@ -66,11 +66,11 @@ export interface SourceAdapter {
 export type PrefetchConfig = {
   /** Default false — opt-in. */
   enabled?: boolean;
-  /** Warm first N seconds of progressive next track via Range. */
+  /** Unused by discrete prefetch (browser readahead). Kept for `warmProgressiveRange`. */
   progressiveSeconds?: number;
   /** HLS ahead / warm buffer budget in seconds. */
   hlsAheadSeconds?: number;
-  /** Default bitrate (bits/s) when byteRateHint is missing. FLAC ≈ 1 Mbps. */
+  /** Unused by discrete prefetch. Default bitrate (bits/s) for `warmProgressiveRange` when byteRateHint is missing. */
   defaultBitrate?: number;
 };
 
