@@ -244,7 +244,7 @@ Stops the current mode, then starts a new one.
 }
 ```
 
-Empty discrete `ids` clears meta and returns. Same-queue skip in the host (see `EnginePlayer`) should use `playAt()` instead of `load()` to avoid tearing down the warm slot.
+Empty discrete `ids` clears meta and emits `trackclear` if a selection existed. A failed new load emits `error` and clears a previous selection. Repeated clearing does not re-emit `trackclear`. Same-queue skip in the host (see `EnginePlayer`) should use `playAt()` instead of `load()` to avoid tearing down the warm slot.
 
 ### `play()` / `pause()`
 
@@ -255,7 +255,7 @@ await engine.pause(): Promise<void>
 
 No-ops if nothing is loaded (`mode === null`).
 
-`play()` unlocks the pool, then `HTMLAudioElement.play()`. Failures that are not abort errors are emitted as `error`. Selection and playback start/resume emit `trackchange` with the current track so a host can render now-playing info from that event alone.
+`play()` unlocks the pool, then `HTMLAudioElement.play()`. Failures that are not abort errors are emitted as `error`. Playback start/resume emits `play`; it does not emit `trackchange` unless the continuous media clock has moved to a different logical item.
 
 `pause()` is fire-and-forget on the element; the method is `async` only to match the rest of the surface.
 
@@ -268,7 +268,7 @@ await engine.seek(time: number): Promise<void>
 - Discrete: sets `audio.currentTime` (seconds on the current file).
 - Continuous: seconds **within the current logical track**; the engine adds the timeline start offset.
 
-Non-finite values are ignored. Seeking resets per-track hooks (`beforeend` / `progress` can fire again).
+Non-finite values and seeks to the existing position are ignored. A seek that moves the clock resets per-track hooks (`beforeend` / `progress` can fire again when playback resumes). Seeking while paused updates the clock without firing playback progress hooks.
 
 ### `next()` / `previous()`
 
@@ -289,12 +289,12 @@ Discrete `ended` auto-calls `next()`. Continuous `ended` means the **whole HLS f
 await engine.playAt(index: number): Promise<void>
 ```
 
-Jump to a queue index without a full `load()`.
+Select a queue index without a full `load()`. Selecting the current item preserves position and the preloaded slot; it resumes if paused and does nothing if already playing. To restart the current item, call `seek(0)` explicitly. An ended current item can be played again from its start.
 
 - Discrete: resolve / promote warm slot / attach, then play (autoplay unless you went through internal `playIndex` with `autoplay: false` — the public method always plays).
-- Continuous: seek the HLS clock to that timeline entry and play.
+- Continuous: a different index seeks the HLS clock to that timeline entry and plays; the current index resumes without seeking.
 
-Out-of-range indexes are ignored.
+Non-integer and out-of-range indexes are ignored.
 
 Use this when the same discrete queue is already loaded (`engine.queueId === …`) so you keep prefetch state.
 
@@ -324,9 +324,9 @@ await engine.replaceSource(opts: {
 }): Promise<void>
 ```
 
-Hot-swap the current media URL without changing queue index / meta.
+Hot-swap the current media URL. Preserving the clock keeps the same queue/track identity and emits no `trackchange`. In continuous mode, replacing without preserving the clock can select a different logical item.
 
-- Discrete: guesses HLS vs progressive from whether `url` contains `.m3u8`. Restores `currentTime` after `loadedmetadata` when `preservePosition` is true. Resumes if it was playing.
+- Discrete: guesses HLS vs progressive from whether `url` contains `.m3u8`. Restores `currentTime` after `loadedmetadata` before binding listeners or resuming when `preservePosition` is true. Resumes if it was playing.
 - Continuous: intended for remux / `cache_key` playlist rotation. Restores the **absolute** HLS clock.
 
 No-op if there is no current meta (discrete) or nothing loaded.
@@ -360,34 +360,40 @@ Tears down mode, Media Session handlers, and the pool. Owned `<audio>` nodes are
 
 ## Events
 
-Listeners are `nanoevents` handlers. `timeupdate` / `beforeend` / `progress` come from an interval (`timeupdateIntervalMs`), not from the media element’s own `timeupdate`. The interval does not re-emit `timeupdate` when `{ currentTime, duration }` is unchanged (paused or stalled). Seek, play, and pause always emit `timeupdate` immediately so the host does not wait for the next tick.
+Listeners are `nanoevents` handlers. `timeupdate` / `beforeend` / `progress` come from an interval (`timeupdateIntervalMs`), not from the media element’s own `timeupdate`. The interval does not re-emit `timeupdate` when `{ currentTime, duration }` is unchanged (paused or stalled). A seek that moves the clock and an actual play/pause transition emit `timeupdate` immediately. Repeated no-op commands do not emit extra events. Native events from pool priming, inactive warm elements, and disposed operations are ignored.
 
 | Event | Payload | When |
 |---|---|---|
-| `play` | none | Current element fired `play`. |
-| `pause` | none | Current element fired `pause` (including end-of-track pause in some browsers). |
-| `ended` | none | Current element ended. Discrete then tries `next()`. Continuous: end of the queue file. |
-| `error` | `{ error: unknown }` | Media error, adapter/prefetch throw (non-abort), expired continuous URL, `play()` rejection. |
-| `trackchange` | `{ track, index, queueId? }` | Current track on selection (including paused loads/skips), playback start/resume, and continuous timeline boundaries. |
+| `play` | none | Committed playback changed from paused to playing. Repeated native `play` events are deduplicated. |
+| `pause` | none | Committed playback changed from playing to paused, including stopping for a discrete switch/source refresh or reaching the end. |
+| `ended` | none | Once per end of the active media source, after the final clock update and pause transition. Discrete then tries `next()`. Continuous: end of the queue file. |
+| `error` | `{ error: unknown }` | Current media/fatal HLS error, adapter/attach/prefetch failure, expired continuous URL, or `play()` rejection. Aborts and stale operations are silent. |
+| `trackchange` | `{ track, index, queueId? }` | A committed change of queue/track identity, including paused selection or a continuous timeline boundary. |
+| `trackclear` | none | The current selection was cleared (empty queue or failed new load). Read the getters/store for the cleared snapshot. |
 | `timeupdate` | `{ currentTime, duration }` | Throttled; skipped when the clock has not moved. Also fired immediately on seek / play / pause. Times are **logical track** times (see getters). |
-| `beforeend` | `{ secondsRemaining, currentTime, duration }` | Once per track when remaining ≤ `hooks.beforeEndSeconds`. Discrete uses this to prefetch. |
-| `progress` | `{ percent, currentTime, duration }` | Once per configured percent threshold per track. Telemetry, not buffered-amount. |
+| `beforeend` | `{ secondsRemaining, currentTime, duration }` | During playback, once per track/seek reset when remaining ≤ `hooks.beforeEndSeconds`. Discrete uses this to prefetch. |
+| `progress` | `{ percent, currentTime, duration }` | During playback (including the final clock), once per configured position threshold per track/seek reset. Paused seeks do not count as playback. |
 
-`trackchange` is the current-track hook. Subscribe to it and render `track` (title, art, id) from the payload. It fires on selection even with `load({ autoplay: false })`, on the current element's `play` (including resume), and when a continuous clock/seek crosses a track boundary, including while paused. Muted playback is included. The pool's internal `unlock()` play/pause cycle does not emit playback or track events and preserves the existing position and mute setting.
+`trackchange` describes the current queue item, independently of playback. Its identity is mode + queue + index + track id. Repeated requests for the same item, pause/resume, seeks within that item, and position-preserving source refreshes do not emit it. The same track id at a different queue position or in a different queue is a different item. When discrete `queueId` is absent, the loaded ids identify the queue; continuous mode uses its adapter queue key. Muting has no effect on identity.
 
-Selection emits once; the first play of that selected track does not emit a duplicate, whether it starts immediately through autoplay or later through `play()`. A later resume re-emits the current track unless a paused selection or boundary already announced it. For history that records track changes, deduplicate consecutive `(queueId, index, track.id)` identities. This is a selection/current-track event, so it is not proof that media successfully decoded or became audible. Use the `play` event, `engine.playing`, and progress hooks if history should count only played tracks.
+Subscribe once to track selection and append history directly; deduplication of identical current-item notifications is handled by the engine:
 
 ```ts
-let lastIdentity: string | undefined;
-engine.on("trackchange", ({ track, index, queueId }) => {
-  const identity = JSON.stringify([queueId, index, track.id]);
-  if (identity === lastIdentity) return;
-  lastIdentity = identity;
+engine.on("trackchange", ({ track }) => {
   history.push(track.id);
+});
+engine.on("trackclear", () => {
+  // Clear host now-playing state from engine.currentMeta / engine.queueId.
 });
 ```
 
-`HookTracker` resets when the selected track changes and on `seek()`, so `beforeend` / `progress` can fire again after a seek backward. A resume `play` re-emits `trackchange` for the same track and does not reset hooks.
+Selection does not prove audible playback. Use `play`, `engine.playing`, and `progress` when history should count listened tracks rather than selected items. `playing` is the committed state reflected by `play`/`pause`, not the pool's transient muted unlock state or a promise that decoding succeeded.
+
+A discrete switch stops the old source (`pause` if it was playing), commits the new selection (`trackchange`), then starts it (`play`). A continuous boundary/skip uses the same playing element and emits only `trackchange`. Event handlers see getters for the committed state. Clearing publishes `trackclear` after the empty selection is visible. `destroy()` cancels media work and removes subscriptions without emitting further events.
+
+`HookTracker` resets on a new selection and on a seek that moves the clock. Resume/reselect of the current item does not reset hooks. Pending metadata seeks are cancelled on a newer operation or destruction; expired work cannot restore the old position or emit errors/playback for a successor source.
+
+See [the event model](events-model.md) for the complete command/event matrix.
 
 ---
 
@@ -458,12 +464,12 @@ Pattern used in `webfront-dev`:
 
 1. Construct `AudioEngine` + `setAdapter` in the player constructor (adapter can run `fetch` later).
 2. `setMediaSessionActions` for headset / lock-screen UX (e.g. Previous restarts if `currentTime > 3`). Do not use `navigator.mediaSession.setActionHandler` directly.
-3. `mount()` + `engine.on(...)` when the UI mounts. Map `trackchange` into app `Track` types — that event reports the selected track and repeats on playback start/resume.
+3. `mount()` + `engine.on(...)` when the UI mounts. Map `trackchange` into app `Track` types — that event reports changes of the current queue item, independently of playback.
 4. On user play: `unlock()` then either `playAt(index)` if `mode === "discrete" && queueId` matches, or `load({ autoplay: true })`.
 5. Do not `load()` again for every skip in the same queue — that drops the warm slot.
 6. `destroy()` on teardown.
 
-`createAudioStore(engine)` (`@homeweblab/audio-engine/svelte`) is a readable store mirroring getters, updated on `play` / `pause` / `trackchange` / `timeupdate` / `ended`. Actions stay on the engine instance.
+`createAudioStore(engine)` (`@homeweblab/audio-engine/svelte`) is a readable store mirroring getters, updated on `play` / `pause` / `trackchange` / `trackclear` / `timeupdate` / `ended`. Actions stay on the engine instance.
 
 ---
 

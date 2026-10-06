@@ -1,3 +1,5 @@
+import { EngineEventState } from "./event-state.js";
+import { isAbortError } from "./expiry.js";
 import { createEngineEmitter, type EngineEmitter } from "./events.js";
 import {
   bindMediaSessionActions,
@@ -20,19 +22,22 @@ import type {
 /** Dual-mode playback controller. See `docs/api.md` for the host-facing API. */
 export class AudioEngine {
   private readonly emitter: EngineEmitter;
+  private readonly eventState: EngineEventState;
+  private destroyed = false;
+  private loadGeneration = 0;
   private readonly options: AudioEngineOptions;
   private pool: DualAudioPool | null = null;
   private adapter: SourceAdapter | null = null;
   private discrete: DiscreteQueueMode | null = null;
   private continuous: ContinuousHlsMode | null = null;
   private _mode: EngineMode | null = null;
-  private unsubs: Array<() => void> = [];
   private sessionOverrides: MediaSessionActionOverrides = {};
   private unbindSession: (() => void) | null = null;
 
   constructor(options: AudioEngineOptions = {}) {
     this.options = options;
     this.emitter = createEngineEmitter();
+    this.eventState = new EngineEventState(this.emitter);
   }
 
   get mode(): EngineMode | null {
@@ -40,10 +45,7 @@ export class AudioEngine {
   }
 
   get playing(): boolean {
-    if (this._mode === "discrete") return this.discrete?.state.playing ?? false;
-    if (this._mode === "continuous")
-      return this.continuous?.state.playing ?? false;
-    return false;
+    return this.eventState.playing;
   }
 
   get currentTime(): number {
@@ -96,6 +98,7 @@ export class AudioEngine {
     next?: HTMLAudioElement;
     container?: HTMLElement | Document;
   }): this {
+    if (this.destroyed) throw new Error("AudioEngine has been destroyed");
     if (this.pool) return this;
     const withCredentials = this.options.hls?.withCredentials ?? true;
     this.pool = new DualAudioPool({
@@ -126,7 +129,14 @@ export class AudioEngine {
   async load(options: LoadOptions): Promise<void> {
     this.ensurePool();
     this.ensureAdapter();
+    const generation = ++this.loadGeneration;
+    this.discrete?.pause();
+    this.continuous?.pause();
     this.teardownModes();
+    // Priming saves/restores element positions. Let an existing cycle finish
+    // before attaching a successor source that could otherwise be rewound.
+    if (this.pool!.isUnlocking) await this.pool!.unlock();
+    if (generation !== this.loadGeneration || this.destroyed) return;
 
     if (options.mode === "discrete") {
       this._mode = "discrete";
@@ -135,11 +145,14 @@ export class AudioEngine {
         this.emitter,
         this.adapter!,
         this.options,
+        this.eventState,
       );
-      await this.discrete.load(options.ids, options.startIndex ?? 0, {
+      const mode = this.discrete;
+      await this.run(mode, () => mode.load(options.ids, options.startIndex ?? 0, {
         queueId: options.queueId,
         autoplay: options.autoplay,
-      });
+      }));
+      if (this.discrete === mode && !mode.state.meta) this.eventState.clear();
       return;
     }
 
@@ -149,16 +162,19 @@ export class AudioEngine {
       this.emitter,
       this.adapter!,
       this.options,
+      this.eventState,
     );
-    await this.continuous.load(options.queueKey, options.startIndex ?? 0, {
+    const mode = this.continuous;
+    await this.run(mode, () => mode.load(options.queueKey, options.startIndex ?? 0, {
       autoplay: options.autoplay,
-    });
+    }));
+    if (this.continuous === mode && !mode.state.meta) this.eventState.clear();
   }
 
   /** Resume the current element. Unlocks the pool first. No-op if not loaded. */
   async play(): Promise<void> {
-    if (this._mode === "discrete") return this.discrete!.play();
-    if (this._mode === "continuous") return this.continuous!.play();
+    const mode = this.discrete ?? this.continuous;
+    if (mode) await this.run(mode, () => mode.play());
   }
 
   /** Pause the current element. No-op if not loaded. */
@@ -172,29 +188,31 @@ export class AudioEngine {
    * current logical track (not the absolute HLS clock).
    */
   async seek(time: number): Promise<void> {
-    if (this._mode === "discrete") this.discrete!.seek(time);
-    else if (this._mode === "continuous") this.continuous!.seek(time);
+    const mode = this.discrete ?? this.continuous;
+    if (mode) await this.run(mode, async () => mode.seek(time));
   }
 
   /** Next queue index. No wrap. Discrete `ended` also calls this. */
   async next(): Promise<void> {
-    if (this._mode === "discrete") return this.discrete!.next();
-    if (this._mode === "continuous") return this.continuous!.next();
+    const mode = this.discrete ?? this.continuous;
+    if (mode) await this.run(mode, () => mode.next());
   }
 
   /** Previous queue index. No wrap. No-op on the first item. */
   async previous(): Promise<void> {
-    if (this._mode === "discrete") return this.discrete!.previous();
-    if (this._mode === "continuous") return this.continuous!.previous();
+    const mode = this.discrete ?? this.continuous;
+    if (mode) await this.run(mode, () => mode.previous());
   }
 
   /**
-   * Jump to a queue index and play, without a full {@link load}.
-   * Prefer this when `queueId` is already loaded.
+   * Select a queue index and play, without a full {@link load}. Selecting
+   * the current item resumes at its existing position. Prefer this when `queueId` is already loaded.
    */
   async playAt(index: number): Promise<void> {
-    if (this._mode === "discrete") return this.discrete!.playIndex(index);
-    if (this._mode === "continuous") return this.continuous!.playAt(index);
+    const mode = this.discrete ?? this.continuous;
+    if (mode) await this.run(mode, () => mode instanceof DiscreteQueueMode
+      ? mode.playIndex(index)
+      : mode.playAt(index));
   }
 
   /**
@@ -212,12 +230,8 @@ export class AudioEngine {
    */
   async replaceSource(opts: ReplaceSourceOptions): Promise<void> {
     const preserve = opts.preservePosition ?? true;
-    if (this._mode === "discrete") {
-      return this.discrete!.replaceSource(opts.url, preserve);
-    }
-    if (this._mode === "continuous") {
-      return this.continuous!.replaceSource(opts.url, preserve);
-    }
+    const mode = this.discrete ?? this.continuous;
+    if (mode) await this.run(mode, () => mode.replaceSource(opts.url, preserve));
   }
 
   /**
@@ -256,14 +270,28 @@ export class AudioEngine {
 
   /** Tear down modes, Media Session, and the audio pool. Not reusable after. */
   destroy(): void {
-    for (const u of this.unsubs) u();
-    this.unsubs = [];
+    if (this.destroyed) return;
+    this.destroyed = true;
+    this.loadGeneration += 1;
     this.unbindSession?.();
     this.unbindSession = null;
     this.teardownModes();
     this.pool?.destroy();
     this.pool = null;
     this._mode = null;
+    this.emitter.events = {};
+    this.eventState.setPlaying(false);
+    this.eventState.clear();
+  }
+
+  private async run(mode: DiscreteQueueMode | ContinuousHlsMode, action: () => Promise<void>): Promise<void> {
+    try {
+      await action();
+    } catch (error) {
+      if (this.destroyed || isAbortError(error) ||
+          (this.discrete !== mode && this.continuous !== mode)) return;
+      this.emitter.emit("error", { error });
+    }
   }
 
   private bindMediaSession(): void {
@@ -300,6 +328,7 @@ export class AudioEngine {
   }
 
   private ensurePool(): void {
+    if (this.destroyed) throw new Error("AudioEngine has been destroyed");
     if (!this.pool) {
       if (typeof document === "undefined") {
         throw new Error("AudioEngine.mount() requires a browser environment");

@@ -160,14 +160,14 @@ export type EngineEvents = {
   ended: () => void;
   error: (payload: { error: unknown }) => void;
   /**
-   * Current track on selection (including paused loads/skips), playback
-   * start/resume, and continuous timeline boundaries. Muted playback is
-   * included; internal pool unlock activity is excluded.
-   * The first play after selection is deduplicated; later resumes can repeat
-   * the same track. History consumers tracking changes only should
-   * deduplicate consecutive { queueId, index, track.id } identities.
+   * A committed change of queue/track identity (mode, queue, index, track id),
+   * including paused selection and continuous timeline boundaries.
+   * Resume, reselecting the current item, seek within that item, and refreshing
+   * its source do not emit. Playback events are independent of track identity.
    */
   trackchange: (payload: TrackChangePayload) => void;
+  /** The current selection was cleared, e.g. by loading an empty queue. */
+  trackclear: () => void;
   timeupdate: (payload: { currentTime: number; duration: number }) => void;
   beforeend: (payload: BeforeEndPayload) => void;
   progress: (payload: ProgressPayload) => void;

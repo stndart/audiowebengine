@@ -35,6 +35,7 @@ export function createAudioStore(
       engine.on("play", refresh),
       engine.on("pause", refresh),
       engine.on("trackchange", refresh),
+      engine.on("trackclear", refresh),
       engine.on("timeupdate", refresh),
       engine.on("ended", refresh),
     ];

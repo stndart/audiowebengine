@@ -1,11 +1,9 @@
 import { isAbortError, isExpiringSoon } from "../expiry.js";
+import { EngineEventState } from "../event-state.js";
+import { seekMedia } from "../media-position.js";
 import type { EngineEmitter } from "../events.js";
 import { HookTracker } from "../hooks.js";
-import {
-  setMediaSessionPlaybackState,
-  updateMediaSessionMetadata,
-  updateMediaSessionPosition,
-} from "../media-session.js";
+import { updateMediaSessionPosition } from "../media-session.js";
 import { DualAudioPool } from "../pool.js";
 import {
   buildTimeline,
@@ -42,7 +40,6 @@ export class ContinuousHlsMode {
   private index = 0;
   private attached: AttachedMedia | null = null;
   private currentMeta: TrackMeta | undefined;
-  private selectedMetaAwaitingPlay: TrackMeta | undefined;
   private hookTracker: HookTracker;
   private timeGate = new TimeupdateGate();
   private timeTimer: ReturnType<typeof setInterval> | null = null;
@@ -51,13 +48,16 @@ export class ContinuousHlsMode {
   private endedHandler: (() => void) | null = null;
   private errorHandler: (() => void) | null = null;
   private gen = 0;
+  private operation = new AbortController();
   private destroyed = false;
+  private wantsPlayback = false;
 
   constructor(
     private pool: DualAudioPool,
     private emitter: EngineEmitter,
     private adapter: SourceAdapter,
     private options: AudioEngineOptions,
+    private eventState: EngineEventState,
   ) {
     this.hookTracker = new HookTracker(options.hooks);
   }
@@ -69,7 +69,7 @@ export class ContinuousHlsMode {
       index: this.index,
       timeline: this.timeline,
       meta: this.currentMeta,
-      playing: !this.pool.current.paused && !this.pool.current.ended,
+      playing: this.eventState.playing,
     };
   }
 
@@ -98,15 +98,24 @@ export class ContinuousHlsMode {
     if (!this.adapter.resolveContinuous) {
       throw new Error("SourceAdapter.resolveContinuous is required for continuous mode");
     }
-    const gen = ++this.gen;
+    const gen = this.beginOperation();
+    this.wantsPlayback = opts?.autoplay !== false;
+    this.stopCurrent();
     this.teardownListeners();
     this.attached?.destroy();
     this.attached = null;
 
     this.queueKey = queueKey;
-    const resolved = await this.adapter.resolveContinuous(queueKey, {
-      intent: "play",
-    });
+    let resolved;
+    try {
+      resolved = await this.adapter.resolveContinuous(queueKey, {
+        intent: "play",
+        signal: this.operation.signal,
+      });
+    } catch (error) {
+      if (gen !== this.gen || this.destroyed || isAbortError(error)) return;
+      throw error;
+    }
     if (gen !== this.gen || this.destroyed) return;
     if (isExpiringSoon(resolved.source.expiresAt)) {
       this.emitter.emit("error", {
@@ -128,6 +137,8 @@ export class ContinuousHlsMode {
 
     const attached = await attachSource(this.pool.current, resolved.source, {
       ...(this.options.hls ?? {}),
+      signal: this.operation.signal,
+      onError: error => this.reportTransportError(error, this.pool.current),
       maxBufferSeconds: ahead,
     });
     if (gen !== this.gen || this.destroyed) {
@@ -142,35 +153,41 @@ export class ContinuousHlsMode {
       // track zero while metadata is still loading.
       await this.seekToEntry(entry, 0);
       if (gen !== this.gen || this.destroyed) return;
-      this.setIndex(findTimelineIndex(this.timeline, this.pool.current.currentTime), true);
+      this.setIndex(findTimelineIndex(this.timeline, this.pool.current.currentTime));
     } else {
       this.currentMeta = undefined;
     }
     this.bindListeners();
 
-    if (opts?.autoplay !== false) {
+    if (this.wantsPlayback) {
       await this.safePlay();
     }
   }
 
   async play(): Promise<void> {
-    await this.pool.unlock();
+    this.wantsPlayback = true;
+    if (!this.attached || !this.currentMeta || this.destroyed) return;
     await this.safePlay();
   }
 
   pause(): void {
-    this.pool.current.pause();
+    this.wantsPlayback = false;
+    this.stopCurrent();
   }
 
   /** Seek within the current logical track. */
   seek(time: number): void {
+    if (!Number.isFinite(time) || !this.attached || this.destroyed) return;
+    this.syncIndexFromClock();
     const entry = this.timeline[this.index];
     if (!entry) {
       this.pool.current.currentTime = Math.max(0, time);
       this.emitTimeClock(true);
       return;
     }
-    this.pool.current.currentTime = timelineSeekTime(entry, time);
+    const target = timelineSeekTime(entry, time);
+    if (target === this.pool.current.currentTime) return;
+    this.pool.current.currentTime = target;
     this.hookTracker.reset();
     this.emitTimeClock(true);
   }
@@ -186,12 +203,20 @@ export class ContinuousHlsMode {
   }
 
   async playAt(index: number): Promise<void> {
+    if (this.destroyed || !Number.isInteger(index)) return;
     const entry = this.timeline[index];
     if (!entry) return;
-    const gen = ++this.gen;
+    this.wantsPlayback = true;
+    this.syncIndexFromClock();
+    if (this.attached && this.currentMeta && index === this.index && !this.pool.current.ended) {
+      await this.play();
+      return;
+    }
+    const gen = this.beginOperation();
     await this.seekToEntry(entry, 0);
     if (gen !== this.gen || this.destroyed) return;
-    this.setIndex(findTimelineIndex(this.timeline, this.pool.current.currentTime), true);
+    this.hookTracker.reset();
+    this.setIndex(findTimelineIndex(this.timeline, this.pool.current.currentTime));
     this.emitTimeClock(true);
     await this.safePlay();
   }
@@ -200,20 +225,28 @@ export class ContinuousHlsMode {
    * Hot-swap m3u8 (e.g. remux cache_key change) while preserving absolute clock.
    */
   async replaceSource(url: string, preservePosition = true): Promise<void> {
+    if (!this.attached || !this.currentMeta || this.destroyed) return;
     const abs = this.pool.current.currentTime;
     const wasPlaying = !this.pool.current.paused;
     const ahead = this.options.prefetch?.hlsAheadSeconds
       ? Math.max(30, this.options.prefetch.hlsAheadSeconds + 20)
       : 30;
 
-    const gen = ++this.gen;
+    const gen = this.beginOperation();
+    this.wantsPlayback = wasPlaying;
+    this.stopCurrent();
     this.teardownListeners();
     this.attached?.destroy();
     this.attached = null;
     const attached = await attachSource(
       this.pool.current,
       { kind: "hls", url },
-      { ...(this.options.hls ?? {}), maxBufferSeconds: ahead },
+      {
+        ...(this.options.hls ?? {}),
+        maxBufferSeconds: ahead,
+        signal: this.operation.signal,
+        onError: error => this.reportTransportError(error, this.pool.current),
+      },
     );
     if (gen !== this.gen || this.destroyed) {
       attached.destroy();
@@ -223,16 +256,17 @@ export class ContinuousHlsMode {
     // Restore the clock before playback can announce a track from offset zero.
     if (preservePosition) await this.seekToTime(abs);
     if (gen !== this.gen || this.destroyed) return;
-    this.syncIndexFromClock(true);
+    this.syncIndexFromClock();
     this.bindListeners();
     this.emitTimeClock(true);
 
-    if (wasPlaying) await this.safePlay();
+    if (this.wantsPlayback) await this.safePlay();
   }
 
   destroy(): void {
     this.destroyed = true;
     this.gen += 1;
+    this.operation.abort();
     this.teardownListeners();
     this.attached?.destroy();
     this.attached = null;
@@ -247,57 +281,46 @@ export class ContinuousHlsMode {
   }
 
   private async seekToTime(target: number): Promise<void> {
-    if (this.pool.current.readyState >= 1) {
-      this.pool.current.currentTime = target;
-      return;
-    }
-    const audio = this.pool.current;
-    const gen = this.gen;
-    await new Promise<void>((resolve) => {
-      const finish = () => {
-        clearTimeout(timeout);
-        audio.removeEventListener("loadedmetadata", finish);
-        if (gen === this.gen && !this.destroyed) {
-          try {
-            audio.currentTime = target;
-          } catch {
-            /* metadata may still be unavailable after the safety timeout */
-          }
-        }
-        resolve();
-      };
-      const timeout = setTimeout(finish, 4000);
-      audio.addEventListener("loadedmetadata", finish);
-    });
+    await seekMedia(this.pool.current, target, this.operation.signal);
   }
 
-  private setIndex(index: number, emit: boolean): void {
+  private beginOperation(): number {
+    this.operation.abort();
+    this.operation = new AbortController();
+    return ++this.gen;
+  }
+
+  private stopCurrent(): void {
+    this.pool.current.pause();
+    if (this.eventState.setPlaying(false)) this.emitTimeClock(true);
+  }
+
+  private setIndex(index: number): void {
+    const changed = index !== this.index || !this.currentMeta;
     this.index = index;
     const entry = this.timeline[index];
     this.currentMeta = entry ? timelineEntryToMeta(entry) : undefined;
-    this.hookTracker.reset();
-    this.timeGate.reset();
-    if (!emit || !this.currentMeta) return;
-    this.selectedMetaAwaitingPlay = this.pool.current.paused
-      ? this.currentMeta
-      : undefined;
+    if (changed) {
+      this.hookTracker.reset();
+      this.timeGate.reset();
+    }
+    if (!this.currentMeta) return;
     this.emitTrackChange();
   }
 
   private emitTrackChange(): void {
     if (!this.currentMeta) return;
-    updateMediaSessionMetadata(this.currentMeta);
-    this.emitter.emit("trackchange", {
+    this.eventState.select(JSON.stringify(["continuous", this.queueKey]), {
       track: this.currentMeta,
       index: this.index,
       queueId: this.queueId,
     });
   }
 
-  private syncIndexFromClock(emit: boolean): void {
+  private syncIndexFromClock(): void {
     const i = findTimelineIndex(this.timeline, this.pool.current.currentTime);
     if (i !== this.index) {
-      this.setIndex(i, emit);
+      this.setIndex(i);
     }
   }
 
@@ -307,28 +330,29 @@ export class ContinuousHlsMode {
 
     this.playHandler = () => {
       if (this.pool.isUnlocking || audio.paused) return;
-      // Synchronize silently first: resume must never announce stale metadata.
-      this.syncIndexFromClock(false);
-      setMediaSessionPlaybackState("playing");
-      // Selection already announced this track; consume that announcement on
-      // its first play. Later resumes still announce the current track.
-      const selectedMeta = this.selectedMetaAwaitingPlay;
-      this.selectedMetaAwaitingPlay = undefined;
-      if (selectedMeta !== this.currentMeta) this.emitTrackChange();
-      this.emitter.emit("play");
+      this.syncIndexFromClock();
+      this.wantsPlayback = true;
+      if (!this.eventState.setPlaying(true)) return;
       this.startTimeLoop();
       this.emitTimeClock(true);
     };
     this.pauseHandler = () => {
       if (this.pool.isUnlocking || !audio.paused) return;
-      setMediaSessionPlaybackState("paused");
-      this.emitter.emit("pause");
+      if (!this.eventState.setPlaying(false)) return;
+      this.wantsPlayback = false;
       this.emitTimeClock(true);
     };
     this.endedHandler = () => {
-      this.emitter.emit("ended");
+      if (!audio.ended || this.destroyed || this.eventState.hasEnded) return;
+      const gen = this.gen;
+      this.emitTimeClock(true, true);
+      if (gen !== this.gen || this.destroyed) return;
+      this.eventState.end();
     };
     this.errorHandler = () => {
+      if (!audio.error || this.destroyed) return;
+      this.wantsPlayback = false;
+      this.eventState.setPlaying(false);
       this.emitter.emit("error", {
         error: audio.error ?? new Error("media error"),
       });
@@ -368,17 +392,18 @@ export class ContinuousHlsMode {
     this.timeGate.reset();
   }
 
-  private emitTimeClock(force = false): void {
+  private emitTimeClock(force = false, terminal = false): void {
     if (this.destroyed || this.pool.isUnlocking || !this.currentMeta) return;
-    this.syncIndexFromClock(true);
+    const gen = this.gen;
+    this.syncIndexFromClock();
     const snapshot = this.timeGate.next(this.currentTime, this.duration, force);
     if (!snapshot) return;
     this.emitter.emit("timeupdate", snapshot);
-    this.hookTracker.tick(
-      this.emitter,
-      snapshot.currentTime,
-      snapshot.duration,
-    );
+    if (gen !== this.gen || this.destroyed) return;
+    if (terminal || (this.eventState.playing && !this.pool.current.paused && !this.pool.current.ended)) {
+      this.hookTracker.tick(this.emitter, snapshot.currentTime, snapshot.duration,
+        () => gen === this.gen && !this.destroyed);
+    }
     updateMediaSessionPosition({
       duration: snapshot.duration,
       position: snapshot.currentTime,
@@ -393,12 +418,25 @@ export class ContinuousHlsMode {
     }
   }
 
+  private reportTransportError(error: unknown, audio: HTMLAudioElement): void {
+    if (this.destroyed) return;
+    if (audio === this.pool.current) {
+      this.wantsPlayback = false;
+      this.stopCurrent();
+    }
+    this.emitter.emit("error", { error });
+  }
+
   private async safePlay(): Promise<void> {
+    const gen = this.gen;
+    const audio = this.pool.current;
     try {
+      if (this.destroyed || !this.attached || !this.wantsPlayback) return;
       await this.pool.unlock();
-      await this.pool.current.play();
+      if (gen !== this.gen || this.destroyed || !this.attached || !this.wantsPlayback) return;
+      await audio.play();
     } catch (e) {
-      if (isAbortError(e)) return;
+      if (isAbortError(e) || gen !== this.gen || this.destroyed) return;
       this.emitter.emit("error", { error: e });
     }
   }

@@ -36,6 +36,7 @@ export class HookTracker {
     emitter: EngineEmitter,
     currentTime: number,
     duration: number,
+    isCurrent: () => boolean = () => true,
   ): void {
     if (!Number.isFinite(duration) || duration <= 0) return;
 
@@ -55,6 +56,7 @@ export class HookTracker {
 
     const pct = (currentTime / duration) * 100;
     for (const threshold of this.progressPercents) {
+      if (!isCurrent()) return;
       if (!this.progressFired.has(threshold) && pct >= threshold) {
         this.progressFired.add(threshold);
         emitter.emit("progress", {
