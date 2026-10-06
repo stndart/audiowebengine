@@ -159,6 +159,13 @@ export type EngineEvents = {
   pause: () => void;
   ended: () => void;
   error: (payload: { error: unknown }) => void;
+  /**
+   * Current track on selection (including paused loads/skips), playback
+   * start/resume, and continuous timeline boundaries. Muted playback is
+   * included; internal pool unlock activity is excluded.
+   * The same track can be emitted more than once; history consumers should
+   * deduplicate consecutive { queueId, index, track.id } identities.
+   */
   trackchange: (payload: TrackChangePayload) => void;
   timeupdate: (payload: { currentTime: number; duration: number }) => void;
   beforeend: (payload: BeforeEndPayload) => void;

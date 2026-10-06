@@ -60,10 +60,10 @@ Browsers treat `HTMLMediaElement.play()` as privileged. The first `play()` usual
 
 This engine uses **two** elements (`current` + `next`). When track N ends, it may swap and call `play()` on the element that was sitting in the warm slot. That swap is **not** a user gesture. If that second element was never played during a gesture, iOS will reject the autoplay and the queue stalls.
 
-`unlock()` is the gesture-time ritual that plays **both** elements once, muted, then immediately pauses and rewinds them:
+`unlock()` primes both paused elements with a muted play/pause cycle, preserving their existing position and mute setting. Already playing elements are left running:
 
 1. Mark the pool as unlocked (idempotent after the first call).
-2. For each of `current` and `next`: `muted = true` → `play()` → `pause()` → `currentTime = 0` → `muted = false`.
+2. For each paused element: save position/mute → `muted = true` → `play()` → `pause()` → restore position/mute. Internal play/pause events are ignored by the modes.
 3. Ignore failures. If the silent play is blocked, the next real `play()` still has to be gesture-driven.
 
 After a successful unlock, later track swaps and `load({ autoplay: true })` can start audio without another tap.
@@ -81,15 +81,15 @@ If you only call `unlock()` later (timer, `trackchange` handler, prefetch callba
 
 ### Side effects you will not see in the method body
 
-The boolean `pool.isUnlocked` is set at the start of `unlock()` so later `play()` on swap can proceed even if the silent `play()` is still settling. Discrete prefetch **attaches** the next `src` without waiting for unlock (buffering does not need a gesture). Call `unlock()` from the play click so iOS allows autoplay on that swap.
+The boolean `pool.isUnlocked` is set at the start of `unlock()` to indicate priming has been attempted. Concurrent calls await the same internal cycle before starting real playback; the flag does not prove the browser permitted autoplay. Discrete prefetch **attaches** the next `src` without waiting for unlock (buffering does not need a gesture). Call `unlock()` from the play click so iOS allows autoplay on that swap.
 
 ### When you do **not** need to call it
 
 `play()` and internal `safePlay()` also call `unlock()`. That covers “user hit Play on an already loaded queue”. Hosts that start playback with `load({ autoplay: true })` from a gesture should still call `unlock()` first so **both** elements are primed before a real `src` is attached.
 
-Call `unlock()` **before** `load()` when possible. If a real source is already on the element, the muted play / pause / `currentTime = 0` sequence can glitch or rewind.
+Call `unlock()` **before** `load()` when possible so both elements can be primed directly from the gesture. If a source is already loaded, unlock preserves its position and mute setting.
 
-Subsequent calls are no-ops.
+Subsequent calls await the first cycle if it is still in progress, then become no-ops.
 
 ---
 
@@ -255,7 +255,7 @@ await engine.pause(): Promise<void>
 
 No-ops if nothing is loaded (`mode === null`).
 
-`play()` unlocks the pool, then `HTMLAudioElement.play()`. Failures that are not abort errors are emitted as `error`.
+`play()` unlocks the pool, then `HTMLAudioElement.play()`. Failures that are not abort errors are emitted as `error`. Selection and playback start/resume emit `trackchange` with the current track so a host can render now-playing info from that event alone.
 
 `pause()` is fire-and-forget on the element; the method is `async` only to match the rest of the surface.
 
@@ -368,12 +368,26 @@ Listeners are `nanoevents` handlers. `timeupdate` / `beforeend` / `progress` com
 | `pause` | none | Current element fired `pause` (including end-of-track pause in some browsers). |
 | `ended` | none | Current element ended. Discrete then tries `next()`. Continuous: end of the queue file. |
 | `error` | `{ error: unknown }` | Media error, adapter/prefetch throw (non-abort), expired continuous URL, `play()` rejection. |
-| `trackchange` | `{ track, index, queueId? }` | New current track after load / skip / continuous clock crossing a boundary. |
+| `trackchange` | `{ track, index, queueId? }` | Current track on selection (including paused loads/skips), playback start/resume, and continuous timeline boundaries. |
 | `timeupdate` | `{ currentTime, duration }` | Throttled; skipped when the clock has not moved. Also fired immediately on seek / play / pause. Times are **logical track** times (see getters). |
 | `beforeend` | `{ secondsRemaining, currentTime, duration }` | Once per track when remaining ≤ `hooks.beforeEndSeconds`. Discrete uses this to prefetch. |
 | `progress` | `{ percent, currentTime, duration }` | Once per configured percent threshold per track. Telemetry, not buffered-amount. |
 
-`HookTracker` resets on track change and on `seek()`, so `beforeend` / `progress` can fire again after a seek backward.
+`trackchange` is the current-track hook. Subscribe to it and render `track` (title, art, id) from the payload. It fires on selection even with `load({ autoplay: false })`, on the current element's `play` (including resume), and when a continuous clock/seek crosses a track boundary, including while paused. Muted playback is included. The pool's internal `unlock()` play/pause cycle does not emit playback or track events and preserves the existing position and mute setting.
+
+A selection followed by autoplay emits the same track for both selection and playback start; resume can also repeat the same track. For history that records track changes, deduplicate consecutive `(queueId, index, track.id)` identities. This is a selection/current-track event, so it is not proof that media successfully decoded or became audible. Use the `play` event, `engine.playing`, and progress hooks if history should count only played tracks.
+
+```ts
+let lastIdentity: string | undefined;
+engine.on("trackchange", ({ track, index, queueId }) => {
+  const identity = JSON.stringify([queueId, index, track.id]);
+  if (identity === lastIdentity) return;
+  lastIdentity = identity;
+  history.push(track.id);
+});
+```
+
+`HookTracker` resets when the selected track changes and on `seek()`, so `beforeend` / `progress` can fire again after a seek backward. A resume `play` re-emits `trackchange` for the same track and does not reset hooks.
 
 ---
 
@@ -444,7 +458,7 @@ Pattern used in `webfront-dev`:
 
 1. Construct `AudioEngine` + `setAdapter` in the player constructor (adapter can run `fetch` later).
 2. `setMediaSessionActions` for headset / lock-screen UX (e.g. Previous restarts if `currentTime > 3`). Do not use `navigator.mediaSession.setActionHandler` directly.
-3. `mount()` + `engine.on(...)` when the UI mounts; map `trackchange` into app `Track` types.
+3. `mount()` + `engine.on(...)` when the UI mounts. Map `trackchange` into app `Track` types — that event reports the selected track and repeats on playback start/resume.
 4. On user play: `unlock()` then either `playAt(index)` if `mode === "discrete" && queueId` matches, or `load({ autoplay: true })`.
 5. Do not `load()` again for every skip in the same queue — that drops the warm slot.
 6. `destroy()` on teardown.

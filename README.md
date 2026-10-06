@@ -4,7 +4,7 @@ Framework-agnostic dual-mode audio engine for music apps (SvelteKit-friendly).
 
 - **Discrete mode** — per-track progressive / HLS URLs, dual `<audio>` pool, next-track warm via `preload="auto"`
 - **Continuous mode** — queue-level m3u8 + virtual timeline (like HomeWebLab webplayer)
-- Events: `play`, `pause`, `trackchange`, `timeupdate`, `beforeend`, `progress`, `ended`, `error`
+- Events: `play`, `pause`, `trackchange` (selection, playback start/resume, and timeline boundaries), `timeupdate`, `beforeend`, `progress`, `ended`, `error`
 - Media Session API
 - Optional `./svelte` store binding and `./offline` Cache/IDB helpers
 - Lazy `hls.js/light` (peer); native HLS on Safari/iOS

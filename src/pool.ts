@@ -6,6 +6,8 @@ export class DualAudioPool {
   private _current: HTMLAudioElement;
   private _next: HTMLAudioElement;
   private unlocked = false;
+  private unlockTask: Promise<void> | null = null;
+  private unlocking = false;
   private owned = false;
 
   constructor(opts?: {
@@ -62,36 +64,56 @@ export class DualAudioPool {
     return this.unlocked;
   }
 
+  /** True only during the pool's internal muted play/pause cycle. */
+  get isUnlocking(): boolean {
+    return this.unlocking;
+  }
+
   /**
    * Gesture-time autoplay unlock for both pool elements (iOS/Safari).
-   * Muted play → pause → rewind. Call before attaching a real `src`.
+   * Muted play → pause, preserving mute and position. Prefer calling before
+   * attaching a real `src`.
    * See `AudioEngine.unlock` / docs/api.md.
    */
   async unlock(): Promise<void> {
-    if (this.unlocked) return;
+    if (this.unlockTask) return this.unlockTask;
     this.unlocked = true;
+    this.unlocking = true;
     const silent = async (el: HTMLAudioElement) => {
+      // Never interrupt playback if a host started the element itself.
+      if (!el.paused) return;
+      const muted = el.muted;
+      const position = el.currentTime;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
         el.muted = true;
         // Empty src: Chrome's play() promise may never settle. Don't block
         // unlock / later attach on that.
         await Promise.race([
           el.play(),
-          new Promise<void>((resolve) => setTimeout(resolve, 120)),
+          new Promise<void>((resolve) => {
+            timeout = setTimeout(resolve, 120);
+          }),
         ]);
       } catch {
         /* ignore — first real play() will still be gesture-driven */
       } finally {
+        clearTimeout(timeout);
         try {
           el.pause();
-          if (el.src) el.currentTime = 0;
+          if (el.src) el.currentTime = position;
         } catch {
           /* ignore */
         }
-        el.muted = false;
+        el.muted = muted;
       }
     };
-    await Promise.all([silent(this._current), silent(this._next)]);
+    this.unlockTask = Promise.all([silent(this._current), silent(this._next)])
+      .then(() => {})
+      .finally(() => {
+        this.unlocking = false;
+      });
+    return this.unlockTask;
   }
 
   /** Promote next → current; old current becomes the warm slot. */

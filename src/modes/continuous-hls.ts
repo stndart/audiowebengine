@@ -135,13 +135,17 @@ export class ContinuousHlsMode {
     }
     this.attached = attached;
 
-    this.bindListeners();
-
     const entry = this.timeline[this.index];
     if (entry) {
+      // Seek before polling/binding so loading a later item cannot announce
+      // track zero while metadata is still loading.
       await this.seekToEntry(entry, 0);
-      this.setIndex(this.index, true);
+      if (gen !== this.gen || this.destroyed) return;
+      this.setIndex(findTimelineIndex(this.timeline, this.pool.current.currentTime), true);
+    } else {
+      this.currentMeta = undefined;
     }
+    this.bindListeners();
 
     if (opts?.autoplay !== false) {
       await this.safePlay();
@@ -183,9 +187,11 @@ export class ContinuousHlsMode {
   async playAt(index: number): Promise<void> {
     const entry = this.timeline[index];
     if (!entry) return;
-    this.index = index;
+    const gen = ++this.gen;
     await this.seekToEntry(entry, 0);
-    this.setIndex(index, true);
+    if (gen !== this.gen || this.destroyed) return;
+    this.setIndex(findTimelineIndex(this.timeline, this.pool.current.currentTime), true);
+    this.emitTimeClock(true);
     await this.safePlay();
   }
 
@@ -213,17 +219,12 @@ export class ContinuousHlsMode {
       return;
     }
     this.attached = attached;
+    // Restore the clock before playback can announce a track from offset zero.
+    if (preservePosition) await this.seekToTime(abs);
+    if (gen !== this.gen || this.destroyed) return;
+    this.syncIndexFromClock(true);
     this.bindListeners();
-
-    if (preservePosition) {
-      const onMeta = () => {
-        this.pool.current.currentTime = abs;
-        this.pool.current.removeEventListener("loadedmetadata", onMeta);
-        this.syncIndexFromClock(true);
-        this.emitTimeClock(true);
-      };
-      this.pool.current.addEventListener("loadedmetadata", onMeta);
-    }
+    this.emitTimeClock(true);
 
     if (wasPlaying) await this.safePlay();
   }
@@ -241,31 +242,31 @@ export class ContinuousHlsMode {
     entry: TimelineEntry,
     offsetSec: number,
   ): Promise<void> {
-    const target = timelineSeekTime(entry, offsetSec);
+    await this.seekToTime(timelineSeekTime(entry, offsetSec));
+  }
+
+  private async seekToTime(target: number): Promise<void> {
     if (this.pool.current.readyState >= 1) {
       this.pool.current.currentTime = target;
-      this.emitTimeClock(true);
       return;
     }
+    const audio = this.pool.current;
+    const gen = this.gen;
     await new Promise<void>((resolve) => {
-      const onMeta = () => {
-        this.pool.current.currentTime = target;
-        this.pool.current.removeEventListener("loadedmetadata", onMeta);
-        this.emitTimeClock(true);
+      const finish = () => {
+        clearTimeout(timeout);
+        audio.removeEventListener("loadedmetadata", finish);
+        if (gen === this.gen && !this.destroyed) {
+          try {
+            audio.currentTime = target;
+          } catch {
+            /* metadata may still be unavailable after the safety timeout */
+          }
+        }
         resolve();
       };
-      this.pool.current.addEventListener("loadedmetadata", onMeta);
-      // Safety timeout
-      setTimeout(() => {
-        this.pool.current.removeEventListener("loadedmetadata", onMeta);
-        try {
-          this.pool.current.currentTime = target;
-        } catch {
-          /* ignore */
-        }
-        this.emitTimeClock(true);
-        resolve();
-      }, 4000);
+      const timeout = setTimeout(finish, 4000);
+      audio.addEventListener("loadedmetadata", finish);
     });
   }
 
@@ -275,14 +276,18 @@ export class ContinuousHlsMode {
     this.currentMeta = entry ? timelineEntryToMeta(entry) : undefined;
     this.hookTracker.reset();
     this.timeGate.reset();
-    if (emit && this.currentMeta) {
-      updateMediaSessionMetadata(this.currentMeta);
-      this.emitter.emit("trackchange", {
-        track: this.currentMeta,
-        index,
-        queueId: this.queueId,
-      });
-    }
+    if (!emit || !this.currentMeta) return;
+    this.emitTrackChange();
+  }
+
+  private emitTrackChange(): void {
+    if (!this.currentMeta) return;
+    updateMediaSessionMetadata(this.currentMeta);
+    this.emitter.emit("trackchange", {
+      track: this.currentMeta,
+      index: this.index,
+      queueId: this.queueId,
+    });
   }
 
   private syncIndexFromClock(emit: boolean): void {
@@ -297,12 +302,17 @@ export class ContinuousHlsMode {
     const audio = this.pool.current;
 
     this.playHandler = () => {
+      if (this.pool.isUnlocking || audio.paused) return;
+      // Synchronize silently first: resume must never announce stale metadata.
+      this.syncIndexFromClock(false);
       setMediaSessionPlaybackState("playing");
+      this.emitTrackChange();
       this.emitter.emit("play");
       this.startTimeLoop();
       this.emitTimeClock(true);
     };
     this.pauseHandler = () => {
+      if (this.pool.isUnlocking || !audio.paused) return;
       setMediaSessionPlaybackState("paused");
       this.emitter.emit("pause");
       this.emitTimeClock(true);
@@ -351,7 +361,7 @@ export class ContinuousHlsMode {
   }
 
   private emitTimeClock(force = false): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.pool.isUnlocking || !this.currentMeta) return;
     this.syncIndexFromClock(true);
     const snapshot = this.timeGate.next(this.currentTime, this.duration, force);
     if (!snapshot) return;

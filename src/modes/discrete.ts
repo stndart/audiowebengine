@@ -52,6 +52,7 @@ export class DiscreteQueueMode {
   private prefetchCtrl = new PrefetchController();
   private prefetchingId: string | null = null;
   private timeTimer: ReturnType<typeof setInterval> | null = null;
+  private listenerAudio: HTMLAudioElement | null = null;
   private endedHandler: (() => void) | null = null;
   private playHandler: (() => void) | null = null;
   private pauseHandler: (() => void) | null = null;
@@ -117,7 +118,7 @@ export class DiscreteQueueMode {
   ): Promise<void> {
     if (index < 0 || index >= this.ids.length) return;
     const gen = this.prefetchCtrl.bump();
-    this.index = index;
+    this.teardownMediaListeners();
 
     const warm = this.nextResolved;
     const canPromote =
@@ -135,6 +136,7 @@ export class DiscreteQueueMode {
       this.nextAttached = null;
       const resolved = this.nextResolved!;
       this.nextResolved = null;
+      this.index = index;
       this.currentMeta = resolved.meta;
       if (resolved.source.kind === "hls") {
         resumeHlsPlayback(
@@ -147,7 +149,7 @@ export class DiscreteQueueMode {
         this.pool.current.preload = "auto";
       }
       this.bindCurrentListeners();
-      this.emitTrackChange();
+      this.onTrackSelected();
       if (opts?.autoplay !== false) {
         await this.safePlay(this.pool.current);
       }
@@ -162,7 +164,6 @@ export class DiscreteQueueMode {
     });
     if (this.stale(gen)) return;
 
-    this.currentMeta = resolved.meta;
     const attached = await attachSource(
       this.pool.current,
       resolved.source,
@@ -173,9 +174,11 @@ export class DiscreteQueueMode {
       return;
     }
 
+    this.index = index;
+    this.currentMeta = resolved.meta;
     this.currentAttached = attached;
     this.bindCurrentListeners();
-    this.emitTrackChange();
+    this.onTrackSelected();
     if (opts?.autoplay !== false) {
       await this.safePlay(this.pool.current);
     }
@@ -282,6 +285,7 @@ export class DiscreteQueueMode {
         ? ("hls" as const)
         : ("progressive" as const);
 
+    this.teardownMediaListeners();
     this.currentAttached?.destroy();
     const attached = await attachSource(
       this.pool.current,
@@ -324,14 +328,18 @@ export class DiscreteQueueMode {
   private bindCurrentListeners(): void {
     this.teardownMediaListeners();
     const audio = this.pool.current;
+    this.listenerAudio = audio;
 
     this.playHandler = () => {
+      if (this.pool.isUnlocking || audio.paused || audio !== this.pool.current) return;
       setMediaSessionPlaybackState("playing");
+      this.emitTrackChange();
       this.emitter.emit("play");
       this.startTimeLoop();
       this.emitTimeClock(true);
     };
     this.pauseHandler = () => {
+      if (this.pool.isUnlocking || !audio.paused || audio !== this.pool.current) return;
       setMediaSessionPlaybackState("paused");
       this.emitter.emit("pause");
       this.emitTimeClock(true);
@@ -354,15 +362,16 @@ export class DiscreteQueueMode {
   }
 
   private teardownMediaListeners(): void {
-    const audio = this.pool.current;
-    if (this.playHandler) audio.removeEventListener("play", this.playHandler);
-    if (this.pauseHandler) audio.removeEventListener("pause", this.pauseHandler);
-    if (this.endedHandler) audio.removeEventListener("ended", this.endedHandler);
-    if (this.errorHandler) audio.removeEventListener("error", this.errorHandler);
+    const audio = this.listenerAudio;
+    if (this.playHandler) audio?.removeEventListener("play", this.playHandler);
+    if (this.pauseHandler) audio?.removeEventListener("pause", this.pauseHandler);
+    if (this.endedHandler) audio?.removeEventListener("ended", this.endedHandler);
+    if (this.errorHandler) audio?.removeEventListener("error", this.errorHandler);
     this.playHandler = null;
     this.pauseHandler = null;
     this.endedHandler = null;
     this.errorHandler = null;
+    this.listenerAudio = null;
     this.stopTimeLoop();
   }
 
@@ -381,7 +390,7 @@ export class DiscreteQueueMode {
   }
 
   private emitTimeClock(force = false): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.pool.isUnlocking || !this.currentMeta) return;
     const currentTime = this.pool.current.currentTime;
     const duration = this.duration;
     const snapshot = this.timeGate.next(currentTime, duration, force);
@@ -394,10 +403,18 @@ export class DiscreteQueueMode {
     });
   }
 
-  private emitTrackChange(): void {
+  /**
+   * Announce the selected track, even while paused, and reset per-track hooks.
+   */
+  private onTrackSelected(): void {
     if (!this.currentMeta) return;
     this.hookTracker.reset();
     this.timeGate.reset();
+    this.emitTrackChange();
+  }
+
+  private emitTrackChange(): void {
+    if (!this.currentMeta) return;
     updateMediaSessionMetadata(this.currentMeta);
     this.emitter.emit("trackchange", {
       track: this.currentMeta,
