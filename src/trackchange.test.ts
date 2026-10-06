@@ -117,15 +117,15 @@ describe.each(["discrete", "continuous"] as const)("%s trackchange", mode => {
     }]);
   });
 
-  it("announces selection, playback start and resume, without unlock events", async () => {
+  it("announces an autoplay selection once and announces later resume", async () => {
     const { engine, ids, plays, pauses, load } = fixture(mode);
     await load(true);
-    expect(ids()).toEqual(["a", "a"]);
+    expect(ids()).toEqual(["a"]);
     expect(plays).toHaveBeenCalledTimes(1);
     expect(pauses).not.toHaveBeenCalled();
     await engine.pause();
     await engine.play();
-    expect(ids()).toEqual(["a", "a", "a"]);
+    expect(ids()).toEqual(["a", "a"]);
     expect(plays).toHaveBeenCalledTimes(2);
     expect(pauses).toHaveBeenCalledTimes(1);
   });
@@ -136,7 +136,7 @@ describe.each(["discrete", "continuous"] as const)("%s trackchange", mode => {
     await load(true);
     expect(engine.playing).toBe(true);
     expect(current.muted).toBe(true);
-    expect(ids()).toEqual(["a", "a"]);
+    expect(ids()).toEqual(["a"]);
   });
 
   it("does not report an explicit unlock as playback or change the selected position", async () => {
@@ -154,10 +154,22 @@ describe.each(["discrete", "continuous"] as const)("%s trackchange", mode => {
     const { engine, ids, load } = fixture(mode);
     await load();
     await engine.next();
-    expect(ids()).toEqual(["a", "b", "b"]);
+    expect(ids()).toEqual(["a", "b"]);
     await engine.previous();
-    expect(ids().at(-1)).toBe("a");
+    expect(ids()).toEqual(["a", "b", "a"]);
     expect(engine.currentIndex).toBe(0);
+  });
+
+  it("does not duplicate a paused selection on its first play", async () => {
+    const { engine, ids, plays, load } = fixture(mode);
+    await load();
+    expect(ids()).toEqual(["a"]);
+    await engine.play();
+    expect(ids()).toEqual(["a"]);
+    expect(plays).toHaveBeenCalledTimes(1);
+    await engine.pause();
+    await engine.play();
+    expect(ids()).toEqual(["a", "a"]);
   });
 
   it("keeps per-track hooks intact on resume", async () => {
@@ -210,6 +222,8 @@ it("continuous boundaries and paused seeks emit exactly one changed track", asyn
   current.currentTime = 21; // A host/native seek uses the absolute clock.
   await vi.advanceTimersByTimeAsync(250);
   expect(ids()).toEqual(["b", "c"]);
+  await engine.play();
+  expect(ids()).toEqual(["b", "c"]);
 });
 
 it("loading a later continuous track waits for metadata without announcing track zero", async () => {
@@ -233,15 +247,15 @@ it("warm discrete promotion detaches listeners from the previous element", async
   plays.mockClear();
   await engine.next();
   expect(engine.mediaElement).toBe(next);
-  expect(ids()).toEqual(["b", "b"]);
+  expect(ids()).toEqual(["b"]);
   expect(plays).toHaveBeenCalledTimes(1);
   await current.play();
-  expect(ids()).toEqual(["b", "b"]);
+  expect(ids()).toEqual(["b"]);
   expect(plays).toHaveBeenCalledTimes(1);
   await engine.prefetchNext();
   await engine.next();
   expect(engine.mediaElement).toBe(current);
-  expect(ids()).toEqual(["b", "b", "c", "c"]);
+  expect(ids()).toEqual(["b", "c"]);
 });
 
 it("discrete ended advances to the next track", async () => {
@@ -252,7 +266,7 @@ it("discrete ended advances to the next track", async () => {
   current.ended = true;
   current.dispatchEvent(new Event("ended"));
   await vi.advanceTimersByTimeAsync(0);
-  expect(ids()).toEqual(["b", "b"]);
+  expect(ids()).toEqual(["b"]);
 });
 
 

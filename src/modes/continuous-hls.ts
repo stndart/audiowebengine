@@ -42,6 +42,7 @@ export class ContinuousHlsMode {
   private index = 0;
   private attached: AttachedMedia | null = null;
   private currentMeta: TrackMeta | undefined;
+  private selectedMetaAwaitingPlay: TrackMeta | undefined;
   private hookTracker: HookTracker;
   private timeGate = new TimeupdateGate();
   private timeTimer: ReturnType<typeof setInterval> | null = null;
@@ -277,6 +278,9 @@ export class ContinuousHlsMode {
     this.hookTracker.reset();
     this.timeGate.reset();
     if (!emit || !this.currentMeta) return;
+    this.selectedMetaAwaitingPlay = this.pool.current.paused
+      ? this.currentMeta
+      : undefined;
     this.emitTrackChange();
   }
 
@@ -306,7 +310,11 @@ export class ContinuousHlsMode {
       // Synchronize silently first: resume must never announce stale metadata.
       this.syncIndexFromClock(false);
       setMediaSessionPlaybackState("playing");
-      this.emitTrackChange();
+      // Selection already announced this track; consume that announcement on
+      // its first play. Later resumes still announce the current track.
+      const selectedMeta = this.selectedMetaAwaitingPlay;
+      this.selectedMetaAwaitingPlay = undefined;
+      if (selectedMeta !== this.currentMeta) this.emitTrackChange();
       this.emitter.emit("play");
       this.startTimeLoop();
       this.emitTimeClock(true);

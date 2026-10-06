@@ -46,6 +46,7 @@ export class DiscreteQueueMode {
   private nextAttached: AttachedMedia | null = null;
   private nextResolved: ResolvedTrack | null = null;
   private currentMeta: TrackMeta | undefined;
+  private selectedMetaAwaitingPlay: TrackMeta | undefined;
   private unsubBeforeEnd: (() => void) | null = null;
   private hookTracker: HookTracker;
   private timeGate = new TimeupdateGate();
@@ -333,7 +334,11 @@ export class DiscreteQueueMode {
     this.playHandler = () => {
       if (this.pool.isUnlocking || audio.paused || audio !== this.pool.current) return;
       setMediaSessionPlaybackState("playing");
-      this.emitTrackChange();
+      // Selection already announced this track; consume that announcement on
+      // its first play. Later resumes still announce the current track.
+      const selectedMeta = this.selectedMetaAwaitingPlay;
+      this.selectedMetaAwaitingPlay = undefined;
+      if (selectedMeta !== this.currentMeta) this.emitTrackChange();
       this.emitter.emit("play");
       this.startTimeLoop();
       this.emitTimeClock(true);
@@ -410,6 +415,9 @@ export class DiscreteQueueMode {
     if (!this.currentMeta) return;
     this.hookTracker.reset();
     this.timeGate.reset();
+    this.selectedMetaAwaitingPlay = this.pool.current.paused
+      ? this.currentMeta
+      : undefined;
     this.emitTrackChange();
   }
 

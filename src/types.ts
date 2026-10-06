@@ -163,7 +163,8 @@ export type EngineEvents = {
    * Current track on selection (including paused loads/skips), playback
    * start/resume, and continuous timeline boundaries. Muted playback is
    * included; internal pool unlock activity is excluded.
-   * The same track can be emitted more than once; history consumers should
+   * The first play after selection is deduplicated; later resumes can repeat
+   * the same track. History consumers tracking changes only should
    * deduplicate consecutive { queueId, index, track.id } identities.
    */
   trackchange: (payload: TrackChangePayload) => void;

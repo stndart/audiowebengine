@@ -375,7 +375,7 @@ Listeners are `nanoevents` handlers. `timeupdate` / `beforeend` / `progress` com
 
 `trackchange` is the current-track hook. Subscribe to it and render `track` (title, art, id) from the payload. It fires on selection even with `load({ autoplay: false })`, on the current element's `play` (including resume), and when a continuous clock/seek crosses a track boundary, including while paused. Muted playback is included. The pool's internal `unlock()` play/pause cycle does not emit playback or track events and preserves the existing position and mute setting.
 
-A selection followed by autoplay emits the same track for both selection and playback start; resume can also repeat the same track. For history that records track changes, deduplicate consecutive `(queueId, index, track.id)` identities. This is a selection/current-track event, so it is not proof that media successfully decoded or became audible. Use the `play` event, `engine.playing`, and progress hooks if history should count only played tracks.
+Selection emits once; the first play of that selected track does not emit a duplicate, whether it starts immediately through autoplay or later through `play()`. A later resume re-emits the current track unless a paused selection or boundary already announced it. For history that records track changes, deduplicate consecutive `(queueId, index, track.id)` identities. This is a selection/current-track event, so it is not proof that media successfully decoded or became audible. Use the `play` event, `engine.playing`, and progress hooks if history should count only played tracks.
 
 ```ts
 let lastIdentity: string | undefined;
